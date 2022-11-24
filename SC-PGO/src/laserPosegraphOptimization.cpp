@@ -24,15 +24,19 @@
 #include <pcl/filters/crop_box.h> 
 #include <pcl_conversions/pcl_conversions.h>
 
-#include <ros/ros.h>
-#include <sensor_msgs/Imu.h>
-#include <sensor_msgs/PointCloud2.h>
-#include <sensor_msgs/NavSatFix.h>
-#include <tf/transform_datatypes.h>
-#include <tf/transform_broadcaster.h>
-#include <nav_msgs/Odometry.h>
-#include <nav_msgs/Path.h>
-#include <geometry_msgs/PoseStamped.h>
+#include <rclcpp/rclcpp.hpp>
+#include <sensor_msgs/msg/imu.hpp>
+#include <sensor_msgs/msg/point_cloud2.hpp>
+#include <sensor_msgs/msg/nav_sat_fix.hpp>
+// #include <tf/transform_datatypes.h>
+#include <tf2/LinearMath/Quaternion.h>
+#include <tf2/LinearMath/Matrix3x3.h>
+#include <tf2/convert.h>
+#include <tf2_geometry_msgs/tf2_geometry_msgs.h>
+#include <tf2_ros/transform_broadcaster.h>
+#include <nav_msgs/msg/odometry.hpp>
+#include <nav_msgs/msg/path.hpp>
+#include <geometry_msgs/msg/pose_stamped.hpp>
 
 #include <eigen3/Eigen/Dense>
 
@@ -62,6 +66,8 @@ using namespace gtsam;
 using std::cout;
 using std::endl;
 
+std::shared_ptr<rclcpp::Node> node;
+
 double keyframeMeterGap;
 double keyframeDegGap, keyframeRadGap;
 double translationAccumulated = 1000000.0; // large value means must add the first given frame.
@@ -72,9 +78,9 @@ bool isNowKeyFrame = false;
 Pose6D odom_pose_prev {0.0, 0.0, 0.0, 0.0, 0.0, 0.0}; // init 
 Pose6D odom_pose_curr {0.0, 0.0, 0.0, 0.0, 0.0, 0.0}; // init pose is zero 
 
-std::queue<nav_msgs::Odometry::ConstPtr> odometryBuf;
-std::queue<sensor_msgs::PointCloud2ConstPtr> fullResBuf;
-std::queue<sensor_msgs::NavSatFix::ConstPtr> gpsBuf;
+std::queue<nav_msgs::msg::Odometry::ConstSharedPtr> odometryBuf;
+std::queue<sensor_msgs::msg::PointCloud2::ConstSharedPtr> fullResBuf;
+std::queue<sensor_msgs::msg::NavSatFix::ConstSharedPtr> gpsBuf;
 std::queue<std::pair<int, int> > scLoopICPBuf;
 
 std::mutex mBuf;
@@ -118,21 +124,27 @@ bool laserCloudMapPGORedraw = true;
 
 bool useGPS = true;
 // bool useGPS = false;
-sensor_msgs::NavSatFix::ConstPtr currGPS;
+sensor_msgs::msg::NavSatFix::ConstSharedPtr currGPS;
 bool hasGPSforThisKF = false;
 bool gpsOffsetInitialized = false; 
 double gpsAltitudeInitOffset = 0.0;
 double recentOptimizedX = 0.0;
 double recentOptimizedY = 0.0;
 
-ros::Publisher pubMapAftPGO, pubOdomAftPGO, pubPathAftPGO;
-ros::Publisher pubLoopScanLocal, pubLoopSubmapLocal;
-ros::Publisher pubOdomRepubVerifier;
+std::shared_ptr<rclcpp::Publisher<sensor_msgs::msg::PointCloud2>> pubMapAftPGO, pubLoopScanLocal, pubLoopSubmapLocal;
+std::shared_ptr<rclcpp::Publisher<nav_msgs::msg::Odometry>>  pubOdomAftPGO, pubOdomRepubVerifier;
+std::shared_ptr<rclcpp::Publisher<nav_msgs::msg::Path>> pubPathAftPGO;
 
 std::string save_directory;
 std::string pgKITTIformat, pgScansDirectory;
 std::string odomKITTIformat;
 std::fstream pgTimeSaveStream;
+
+double toSec(const builtin_interfaces::msg::Time& stamp) {
+  const double sec = (double) stamp.sec;
+  const double nsec = (double) stamp.nanosec;
+  return (double)sec + 1e-9*(double)nsec;
+}
 
 std::string padZeros(int val, int num_digits = 6) {
   std::ostringstream out;
@@ -188,21 +200,21 @@ void saveOptimizedVerticesKITTIformat(gtsam::Values _estimates, std::string _fil
     }
 }
 
-void laserOdometryHandler(const nav_msgs::Odometry::ConstPtr &_laserOdometry)
+void laserOdometryHandler(const nav_msgs::msg::Odometry::ConstSharedPtr _laserOdometry)
 {
 	mBuf.lock();
 	odometryBuf.push(_laserOdometry);
 	mBuf.unlock();
 } // laserOdometryHandler
 
-void laserCloudFullResHandler(const sensor_msgs::PointCloud2ConstPtr &_laserCloudFullRes)
+void laserCloudFullResHandler(const sensor_msgs::msg::PointCloud2::ConstSharedPtr _laserCloudFullRes)
 {
 	mBuf.lock();
 	fullResBuf.push(_laserCloudFullRes);
 	mBuf.unlock();
 } // laserCloudFullResHandler
 
-void gpsHandler(const sensor_msgs::NavSatFix::ConstPtr &_gps)
+void gpsHandler(const sensor_msgs::msg::NavSatFix::ConstSharedPtr _gps)
 {
     if(useGPS) {
         mBuf.lock();
@@ -239,15 +251,15 @@ void initNoises( void )
 
 } // initNoises
 
-Pose6D getOdom(nav_msgs::Odometry::ConstPtr _odom)
+Pose6D getOdom(nav_msgs::msg::Odometry::ConstSharedPtr _odom)
 {
     auto tx = _odom->pose.pose.position.x;
     auto ty = _odom->pose.pose.position.y;
     auto tz = _odom->pose.pose.position.z;
 
     double roll, pitch, yaw;
-    geometry_msgs::Quaternion quat = _odom->pose.pose.orientation;
-    tf::Matrix3x3(tf::Quaternion(quat.x, quat.y, quat.z, quat.w)).getRPY(roll, pitch, yaw);
+    geometry_msgs::msg::Quaternion quat = _odom->pose.pose.orientation;
+    tf2::Matrix3x3(tf2::Quaternion(quat.x, quat.y, quat.z, quat.w)).getRPY(roll, pitch, yaw);
 
     return Pose6D{tx, ty, tz, roll, pitch, yaw}; 
 } // getOdom
@@ -291,8 +303,8 @@ pcl::PointCloud<PointType>::Ptr local2global(const pcl::PointCloud<PointType>::P
 void pubPath( void )
 {
     // pub odom and path 
-    nav_msgs::Odometry odomAftPGO;
-    nav_msgs::Path pathAftPGO;
+    nav_msgs::msg::Odometry odomAftPGO;
+    nav_msgs::msg::Path pathAftPGO;
     pathAftPGO.header.frame_id = "camera_init";
     mKF.lock(); 
     // for (int node_idx=0; node_idx < int(keyframePosesUpdated.size()) - 1; node_idx++) // -1 is just delayed visualization (because sometimes mutexed while adding(push_back) a new one)
@@ -301,17 +313,21 @@ void pubPath( void )
         const Pose6D& pose_est = keyframePosesUpdated.at(node_idx); // upodated poses
         // const gtsam::Pose3& pose_est = isamCurrentEstimate.at<gtsam::Pose3>(node_idx);
 
-        nav_msgs::Odometry odomAftPGOthis;
+        nav_msgs::msg::Odometry odomAftPGOthis;
         odomAftPGOthis.header.frame_id = "camera_init";
         odomAftPGOthis.child_frame_id = "/aft_pgo";
-        odomAftPGOthis.header.stamp = ros::Time().fromSec(keyframeTimes.at(node_idx));
+        odomAftPGOthis.header.stamp = rclcpp::Time(keyframeTimes.at(node_idx) * 10e9);
         odomAftPGOthis.pose.pose.position.x = pose_est.x;
         odomAftPGOthis.pose.pose.position.y = pose_est.y;
         odomAftPGOthis.pose.pose.position.z = pose_est.z;
-        odomAftPGOthis.pose.pose.orientation = tf::createQuaternionMsgFromRollPitchYaw(pose_est.roll, pose_est.pitch, pose_est.yaw);
+        tf2::Quaternion q;
+        q.setRPY(pose_est.roll, pose_est.pitch, pose_est.yaw);
+        // geometry_msgs::msg::Quaternion q_msg;
+        // tf2::convert(q, q_msg);
+        odomAftPGOthis.pose.pose.orientation = tf2::toMsg(q);
         odomAftPGO = odomAftPGOthis;
 
-        geometry_msgs::PoseStamped poseStampAftPGO;
+        geometry_msgs::msg::PoseStamped poseStampAftPGO;
         poseStampAftPGO.header = odomAftPGOthis.header;
         poseStampAftPGO.pose = odomAftPGOthis.pose.pose;
 
@@ -320,19 +336,30 @@ void pubPath( void )
         pathAftPGO.poses.push_back(poseStampAftPGO);
     }
     mKF.unlock(); 
-    pubOdomAftPGO.publish(odomAftPGO); // last pose 
-    pubPathAftPGO.publish(pathAftPGO); // poses 
+    pubOdomAftPGO->publish(odomAftPGO); // last pose 
+    pubPathAftPGO->publish(pathAftPGO); // poses 
 
-    static tf::TransformBroadcaster br;
-    tf::Transform transform;
-    tf::Quaternion q;
-    transform.setOrigin(tf::Vector3(odomAftPGO.pose.pose.position.x, odomAftPGO.pose.pose.position.y, odomAftPGO.pose.pose.position.z));
-    q.setW(odomAftPGO.pose.pose.orientation.w);
-    q.setX(odomAftPGO.pose.pose.orientation.x);
-    q.setY(odomAftPGO.pose.pose.orientation.y);
-    q.setZ(odomAftPGO.pose.pose.orientation.z);
-    transform.setRotation(q);
-    br.sendTransform(tf::StampedTransform(transform, odomAftPGO.header.stamp, "camera_init", "/aft_pgo"));
+    static std::unique_ptr<tf2_ros::TransformBroadcaster> br = std::make_unique<tf2_ros::TransformBroadcaster>(node);
+    // tf::Transform transform;
+    geometry_msgs::msg::TransformStamped transform;
+    transform.header.stamp = odomAftPGO.header.stamp;
+    transform.header.frame_id = "camera_init";
+    transform.child_frame_id = "/aft_pgo";
+    // transform.setOrigin(tf::Vector3(odomAftPGO.pose.pose.position.x, odomAftPGO.pose.pose.position.y, odomAftPGO.pose.pose.position.z));
+    transform.transform.translation.x = odomAftPGO.pose.pose.position.x;
+    transform.transform.translation.y = odomAftPGO.pose.pose.position.y;
+    transform.transform.translation.z = odomAftPGO.pose.pose.position.z;
+    // tf::Quaternion q;
+    // q.setW(odomAftPGO.pose.pose.orientation.w);
+    // q.setX(odomAftPGO.pose.pose.orientation.x);
+    // q.setY(odomAftPGO.pose.pose.orientation.y);
+    // q.setZ(odomAftPGO.pose.pose.orientation.z);
+    // transform.setRotation(q);
+    transform.transform.rotation.x = odomAftPGO.pose.pose.orientation.x;
+    transform.transform.rotation.y = odomAftPGO.pose.pose.orientation.y;
+    transform.transform.rotation.z = odomAftPGO.pose.pose.orientation.z;
+    transform.transform.rotation.w = odomAftPGO.pose.pose.orientation.w;
+    br->sendTransform(transform);
 } // pubPath
 
 void updatePoses(void)
@@ -434,15 +461,15 @@ std::optional<gtsam::Pose3> doICPVirtualRelative( int _loop_kf_idx, int _curr_kf
     loopFindNearKeyframesCloud(targetKeyframeCloud, _loop_kf_idx, historyKeyframeSearchNum, _loop_kf_idx); 
 
     // loop verification 
-    sensor_msgs::PointCloud2 cureKeyframeCloudMsg;
+    sensor_msgs::msg::PointCloud2 cureKeyframeCloudMsg;
     pcl::toROSMsg(*cureKeyframeCloud, cureKeyframeCloudMsg);
     cureKeyframeCloudMsg.header.frame_id = "camera_init";
-    pubLoopScanLocal.publish(cureKeyframeCloudMsg);
+    pubLoopScanLocal->publish(cureKeyframeCloudMsg);
 
-    sensor_msgs::PointCloud2 targetKeyframeCloudMsg;
+    sensor_msgs::msg::PointCloud2 targetKeyframeCloudMsg;
     pcl::toROSMsg(*targetKeyframeCloud, targetKeyframeCloudMsg);
     targetKeyframeCloudMsg.header.frame_id = "camera_init";
-    pubLoopSubmapLocal.publish(targetKeyframeCloudMsg);
+    pubLoopSubmapLocal->publish(targetKeyframeCloudMsg);
 
     // ICP Settings
     pcl::IterativeClosestPoint<PointType, PointType> icp;
@@ -487,7 +514,7 @@ void process_pg()
             // pop and check keyframe is or not  
             // 
 			mBuf.lock();       
-            while (!odometryBuf.empty() && odometryBuf.front()->header.stamp.toSec() < fullResBuf.front()->header.stamp.toSec())
+            while (!odometryBuf.empty() && toSec(odometryBuf.front()->header.stamp) < toSec(fullResBuf.front()->header.stamp))
                 odometryBuf.pop();
             if (odometryBuf.empty())
             {
@@ -496,8 +523,8 @@ void process_pg()
             }
 
             // Time equal check
-            timeLaserOdometry = odometryBuf.front()->header.stamp.toSec();
-            timeLaser = fullResBuf.front()->header.stamp.toSec();
+            timeLaserOdometry = toSec(odometryBuf.front()->header.stamp);
+            timeLaser = toSec(fullResBuf.front()->header.stamp);
             // TODO
 
             laserCloudFullRes->clear();
@@ -512,7 +539,7 @@ void process_pg()
             double eps = 0.1; // find a gps topioc arrived within eps second 
             while (!gpsBuf.empty()) {
                 auto thisGPS = gpsBuf.front();
-                auto thisGPSTime = thisGPS->header.stamp.toSec();
+                auto thisGPSTime = toSec(thisGPS->header.stamp);
                 if( abs(thisGPSTime - timeLaserOdometry) < eps ) {
                     currGPS = thisGPS;
                     hasGPSforThisKF = true; 
@@ -656,8 +683,8 @@ void performSCLoopClosure(void)
 void process_lcd(void)
 {
     float loopClosureFrequency = 1.0; // can change 
-    ros::Rate rate(loopClosureFrequency);
-    while (ros::ok())
+    rclcpp::Rate rate(loopClosureFrequency);
+    while (rclcpp::ok())
     {
         rate.sleep();
         performSCLoopClosure();
@@ -672,7 +699,7 @@ void process_icp(void)
 		while ( !scLoopICPBuf.empty() )
         {
             if( scLoopICPBuf.size() > 30 ) {
-                ROS_WARN("Too many loop clousre candidates to be ICPed is waiting ... Do process_lcd less frequently (adjust loopClosureFrequency)");
+                RCLCPP_WARN(node->get_logger(), "Too many loop clousre candidates to be ICPed is waiting ... Do process_lcd less frequently (adjust loopClosureFrequency)");
             }
 
             mBuf.lock(); 
@@ -701,8 +728,8 @@ void process_icp(void)
 void process_viz_path(void)
 {
     float hz = 10.0; 
-    ros::Rate rate(hz);
-    while (ros::ok()) {
+    rclcpp::Rate rate(hz);
+    while (rclcpp::ok()) {
         rate.sleep();
         if(recentIdxUpdated > 1) {
             pubPath();
@@ -713,8 +740,8 @@ void process_viz_path(void)
 void process_isam(void)
 {
     float hz = 1; 
-    ros::Rate rate(hz);
-    while (ros::ok()) {
+    rclcpp::Rate rate(hz);
+    while (rclcpp::ok()) {
         rate.sleep();
         if( gtSAMgraphMade ) {
             mtxPosegraph.lock();
@@ -748,17 +775,17 @@ void pubMap(void)
     downSizeFilterMapPGO.setInputCloud(laserCloudMapPGO);
     downSizeFilterMapPGO.filter(*laserCloudMapPGO);
 
-    sensor_msgs::PointCloud2 laserCloudMapPGOMsg;
+    sensor_msgs::msg::PointCloud2 laserCloudMapPGOMsg;
     pcl::toROSMsg(*laserCloudMapPGO, laserCloudMapPGOMsg);
     laserCloudMapPGOMsg.header.frame_id = "camera_init";
-    pubMapAftPGO.publish(laserCloudMapPGOMsg);
+    pubMapAftPGO->publish(laserCloudMapPGOMsg);
 }
 
 void process_viz_map(void)
 {
     float vizmapFrequency = 0.1; // 0.1 means run onces every 10s
-    ros::Rate rate(vizmapFrequency);
-    while (ros::ok()) {
+    rclcpp::Rate rate(vizmapFrequency);
+    while (rclcpp::ok()) {
         rate.sleep();
         if(recentIdxUpdated > 1) {
             pubMap();
@@ -769,10 +796,11 @@ void process_viz_map(void)
 
 int main(int argc, char **argv)
 {
-	ros::init(argc, argv, "laserPGO");
-	ros::NodeHandle nh;
+  rclcpp::init(argc, argv);
+  node = rclcpp::Node::make_shared("laserPGO");
 
-	nh.param<std::string>("save_directory", save_directory, "/"); // pose assignment every k m move 
+  node->declare_parameter("save_directory", "/"); // pose assignment every k m move 
+  save_directory = node->get_parameter("save_directory").get_parameter_value().get<std::string>();
     pgKITTIformat = save_directory + "optimized_poses.txt";
     odomKITTIformat = save_directory + "odom_poses.txt";
     pgTimeSaveStream = std::fstream(save_directory + "times.txt", std::fstream::out); 
@@ -781,12 +809,16 @@ int main(int argc, char **argv)
     auto unused = system((std::string("exec rm -r ") + pgScansDirectory).c_str());
     unused = system((std::string("mkdir -p ") + pgScansDirectory).c_str());
 
-	nh.param<double>("keyframe_meter_gap", keyframeMeterGap, 2.0); // pose assignment every k m move 
-	nh.param<double>("keyframe_deg_gap", keyframeDegGap, 10.0); // pose assignment every k deg rot 
+  node->declare_parameter("keyframe_meter_gap", 2.0); // pose assignment every k m move 
+  keyframeMeterGap = node->get_parameter("keyframe_meter_gap").get_parameter_value().get<double>();
+  node->declare_parameter("keyframe_deg_gap", 10.0); // pose assignment every k deg rot 
+  keyframeDegGap = node->get_parameter("keyframe_deg_gap").get_parameter_value().get<double>();
     keyframeRadGap = deg2rad(keyframeDegGap);
 
-	nh.param<double>("sc_dist_thres", scDistThres, 0.2);  
-	nh.param<double>("sc_max_radius", scMaximumRadius, 80.0); // 80 is recommended for outdoor, and lower (ex, 20, 40) values are recommended for indoor 
+  node->declare_parameter("sc_dist_thres", 0.2);
+  scDistThres = node->get_parameter("keyframe_deg_gap").get_parameter_value().get<double>();
+  node->declare_parameter("sc_max_radius", 80.0); // 80 is recommended for outdoor, and lower (ex, 20, 40) values are recommended for indoor 
+  scMaximumRadius = node->get_parameter("sc_max_radius").get_parameter_value().get<double>();
 
     ISAM2Params parameters;
     parameters.relinearizeThreshold = 0.01;
@@ -802,20 +834,21 @@ int main(int argc, char **argv)
     downSizeFilterICP.setLeafSize(filter_size, filter_size, filter_size);
 
     double mapVizFilterSize;
-	nh.param<double>("mapviz_filter_size", mapVizFilterSize, 0.4); // pose assignment every k frames 
+  node->declare_parameter("mapviz_filter_size", 0.4); // pose assignment every k frames 
+  mapVizFilterSize = node->get_parameter("mapviz_filter_size").get_parameter_value().get<double>();
     downSizeFilterMapPGO.setLeafSize(mapVizFilterSize, mapVizFilterSize, mapVizFilterSize);
 
-	ros::Subscriber subLaserCloudFullRes = nh.subscribe<sensor_msgs::PointCloud2>("/velodyne_cloud_registered_local", 100, laserCloudFullResHandler);
-	ros::Subscriber subLaserOdometry = nh.subscribe<nav_msgs::Odometry>("/aft_mapped_to_init", 100, laserOdometryHandler);
-	ros::Subscriber subGPS = nh.subscribe<sensor_msgs::NavSatFix>("/gps/fix", 100, gpsHandler);
+	auto subLaserCloudFullRes = node->create_subscription<sensor_msgs::msg::PointCloud2>("/velodyne_cloud_registered_local", 100, laserCloudFullResHandler);
+	auto subLaserOdometry = node->create_subscription<nav_msgs::msg::Odometry>("/aft_mapped_to_init", 100, laserOdometryHandler);
+	auto subGPS = node->create_subscription<sensor_msgs::msg::NavSatFix>("/gps/fix", 100, gpsHandler);
 
-	pubOdomAftPGO = nh.advertise<nav_msgs::Odometry>("/aft_pgo_odom", 100);
-	pubOdomRepubVerifier = nh.advertise<nav_msgs::Odometry>("/repub_odom", 100);
-	pubPathAftPGO = nh.advertise<nav_msgs::Path>("/aft_pgo_path", 100);
-	pubMapAftPGO = nh.advertise<sensor_msgs::PointCloud2>("/aft_pgo_map", 100);
+	pubOdomAftPGO = node->create_publisher<nav_msgs::msg::Odometry>("/aft_pgo_odom", 100);
+	pubOdomRepubVerifier = node->create_publisher<nav_msgs::msg::Odometry>("/repub_odom", 100);
+	pubPathAftPGO = node->create_publisher<nav_msgs::msg::Path>("/aft_pgo_path", 100);
+	pubMapAftPGO = node->create_publisher<sensor_msgs::msg::PointCloud2>("/aft_pgo_map", 100);
 
-	pubLoopScanLocal = nh.advertise<sensor_msgs::PointCloud2>("/loop_scan_local", 100);
-	pubLoopSubmapLocal = nh.advertise<sensor_msgs::PointCloud2>("/loop_submap_local", 100);
+	pubLoopScanLocal = node->create_publisher<sensor_msgs::msg::PointCloud2>("/loop_scan_local", 100);
+	pubLoopSubmapLocal = node->create_publisher<sensor_msgs::msg::PointCloud2>("/loop_submap_local", 100);
 
 	std::thread posegraph_slam {process_pg}; // pose graph construction
 	std::thread lc_detection {process_lcd}; // loop closure detection 
@@ -825,7 +858,7 @@ int main(int argc, char **argv)
 	std::thread viz_map {process_viz_map}; // visualization - map (low frequency because it is heavy)
 	std::thread viz_path {process_viz_path}; // visualization - path (high frequency)
 
- 	ros::spin();
+ 	rclcpp::spin(node);
 
 	return 0;
 }
