@@ -1,4 +1,21 @@
-> Maintainer: Yunlong Feng
+## Execution of Package
+Prerequisites:
+* [Docker](https://docs.docker.com/engine/install/ubuntu/)
+* [NVIDIA-Docker](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)
+* [OSRF-Rocker](https://github.com/osrf/rocker)
+
+Run in a terminal:
+```
+rocker --nvidia --x11 \
+       ghcr.io/transmisiones-centauro/fast_lio_slam_ros2:ericsii-fast_lio-ros2
+```
+Run inside the container:
+```
+source /livox_ws/install/setup.bash
+source /ros2_ws/install/setup.bash
+ros2 launch fast_lio mapping.launch.py 
+```
+TODO: ros2 bag play ...
 
 ## Related Works and Extended Application
 
